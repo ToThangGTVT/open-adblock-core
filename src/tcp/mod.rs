@@ -102,8 +102,13 @@ pub async fn serve(
                     }
                     let selected = crate::mitm::current().apps.iter().any(|app| owner.packages.contains(app));
                     let tls = matches!(parsed, sniff::Parsed::Tls(_)) && matches!(destination.port(), 443 | 8443) && !owner.bypass;
-                    if let Ok(mut upstream) = sockets::connect_tcp(destination, protector.as_ref(), &stats).await {
-                        if upstream.write_all(&initial).await.is_err() { return; }
+                    if let Ok(upstream) = sockets::connect_tcp(destination, protector.as_ref(), &stats).await {
+                        // GoodbyeDPI-style tricks on the first request (and keep-alive HTTP requests).
+                        // Bypassed apps are never sniffed, so never touched.
+                        let desync = crate::dpi::enabled() && !owner.bypass && !matches!(parsed, sniff::Parsed::Unknown);
+                        let host = match &parsed { sniff::Parsed::Tls(h) | sniff::Parsed::Http { host: h, .. } => Some(h.clone()), _ => None };
+                        let mut upstream = crate::dpi::Desync::new(upstream, host, desync);
+                        if upstream.write_all(&initial).await.is_err() || upstream.flush().await.is_err() { return; }
                         let idle = idle_timeout(activity.clone());
                         let relay = tokio::io::copy_bidirectional(&mut client, &mut upstream);
                         tokio::pin!(relay, idle);

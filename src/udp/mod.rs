@@ -148,6 +148,13 @@ pub async fn serve(
 /// proxy can decrypt it. Every other app keeps HTTP/3: DNS blocking works the same over QUIC.
 /// Returns the reverse-looked-up domain for the event when the datagram is dropped.
 fn drops_quic(owner: &crate::policy::Owner, original: SocketAddr) -> Option<Option<String>> {
+    // GoodbyeDPI `-q`: with DPI circumvention on, HTTP/3 falls back to TCP, where it applies.
+    if original.port() == 443 && !owner.bypass {
+        let domain = crate::dns::reverse::lookup(owner.uid, original.ip());
+        if crate::dpi::drops_quic(domain.as_deref()) {
+            return Some(domain);
+        }
+    }
     if original.port() != 443
         || !crate::policy::current().block_quic
         || !crate::mitm::filters_app(owner)

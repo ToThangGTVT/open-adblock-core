@@ -1,5 +1,6 @@
 //! Rust full-tunnel engine. Only connection metadata counters cross JNI in Phase 1.
 pub mod dns;
+pub mod dpi;
 pub mod filter;
 pub mod mitm;
 pub mod policy;

@@ -92,7 +92,10 @@ fn test_connector(
         Box::pin(async move {
             let raw = sockets::connect_tcp(address, guard.as_ref(), &stats).await?;
             TlsConnector::from(config)
-                .connect(ServerName::try_from(domain).map_err(io::Error::other)?, raw)
+                .connect(
+                    ServerName::try_from(domain).map_err(io::Error::other)?,
+                    blockads_core::dpi::Desync::new(raw, None, false),
+                )
                 .await
         })
     })
@@ -370,7 +373,10 @@ async fn http1_http2_translation_filters_paths_preserves_keepalive_and_streams_b
                 .await
                 .unwrap();
             let verified = TlsConnector::from(client_config(&peer_root, upstream_h2))
-                .connect(ServerName::try_from(domain.clone()).unwrap(), raw)
+                .connect(
+                    ServerName::try_from(domain.clone()).unwrap(),
+                    blockads_core::dpi::Desync::new(raw, None, false),
+                )
                 .await
                 .unwrap();
             let (front, back) = tokio::io::duplex(65536);
@@ -565,7 +571,10 @@ async fn http2_concurrent_streams_multiplex_over_one_upstream_connection() {
         .await
         .unwrap();
     let verified = TlsConnector::from(client_config(&peer_root, true))
-        .connect(ServerName::try_from(domain.clone()).unwrap(), raw)
+        .connect(
+            ServerName::try_from(domain.clone()).unwrap(),
+            blockads_core::dpi::Desync::new(raw, None, false),
+        )
         .await
         .unwrap();
     let (front, back) = tokio::io::duplex(65536);
@@ -683,7 +692,10 @@ async fn large_header_blocks_pass_in_both_directions() {
             .await
             .unwrap();
         let verified = TlsConnector::from(client_config(&peer_root, true))
-            .connect(ServerName::try_from(domain.clone()).unwrap(), raw)
+            .connect(
+                ServerName::try_from(domain.clone()).unwrap(),
+                blockads_core::dpi::Desync::new(raw, None, false),
+            )
             .await
             .unwrap();
         let (front, back) = tokio::io::duplex(65536);
@@ -1212,7 +1224,10 @@ async fn closed_upstream_is_reopened_while_browser_keeps_its_tls_connection() {
             .await
             .unwrap();
         let verified = TlsConnector::from(client_config(&peer_root, upstream_h2))
-            .connect(ServerName::try_from(domain.clone()).unwrap(), raw)
+            .connect(
+                ServerName::try_from(domain.clone()).unwrap(),
+                blockads_core::dpi::Desync::new(raw, None, false),
+            )
             .await
             .unwrap();
         let (front, back) = tokio::io::duplex(65536);

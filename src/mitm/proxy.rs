@@ -38,14 +38,20 @@ enum Sender {
     H1(hyper::client::conn::http1::SendRequest<Body>),
     H2(hyper::client::conn::http2::SendRequest<Body>),
 }
-pub type Connector =
-    Arc<dyn Fn() -> BoxFuture<'static, io::Result<TlsStream<tokio::net::TcpStream>>> + Send + Sync>;
+pub type Connector = Arc<
+    dyn Fn() -> BoxFuture<'static, io::Result<TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>>>
+        + Send
+        + Sync,
+>;
 pub struct VerifiedUpstream {
-    tls: TlsStream<tokio::net::TcpStream>,
+    tls: TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>,
     reconnect: Connector,
 }
 impl VerifiedUpstream {
-    pub fn new(tls: TlsStream<tokio::net::TcpStream>, reconnect: Connector) -> Self {
+    pub fn new(
+        tls: TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>,
+        reconnect: Connector,
+    ) -> Self {
         Self { tls, reconnect }
     }
 }
@@ -106,8 +112,12 @@ pub async fn upstream(
     domain: &str,
     protector: &dyn Protector,
     stats: &Arc<Stats>,
-) -> io::Result<TlsStream<tokio::net::TcpStream>> {
-    let raw = sockets::connect_tcp(destination, protector, stats).await?;
+) -> io::Result<TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>> {
+    let raw = crate::dpi::Desync::new(
+        sockets::connect_tcp(destination, protector, stats).await?,
+        Some(domain.to_owned()),
+        crate::dpi::enabled(),
+    );
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -138,7 +148,7 @@ pub fn connector(
     })
 }
 async fn connection(
-    upstream: TlsStream<tokio::net::TcpStream>,
+    upstream: TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>,
     domain: String,
     uid: Option<u32>,
 ) -> io::Result<(Sender, Driver)> {

@@ -12,6 +12,8 @@ use std::{
 #[serde(default, rename_all = "camelCase")]
 pub struct Options {
     pub block_quic: bool,
+    /// GoodbyeDPI-style circumvention, see `dpi`.
+    pub dpi: crate::dpi::Options,
     pub ipv6: bool,
     pub bypass_uids: Vec<u32>,
     pub blocked_uids: Vec<u32>,
@@ -21,6 +23,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             block_quic: true,
+            dpi: crate::dpi::Options::default(),
             ipv6: true,
             bypass_uids: vec![],
             blocked_uids: vec![],
@@ -46,6 +49,7 @@ pub fn configure(json: &str) -> bool {
     let Ok(mut options) = serde_json::from_str::<Options>(json) else {
         return false;
     };
+    options.dpi.normalize();
     options.blocked_uids.sort_unstable();
     options.blocked_uids.dedup();
     let blocked = options.blocked_uids.clone();
