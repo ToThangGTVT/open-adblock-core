@@ -5,3 +5,6 @@
 .idea/
 *.iml
 .DS_Store
+/bindings/swift/Artifacts/
+/bindings/swift/.build/
+/bindings/swift/.swiftpm/

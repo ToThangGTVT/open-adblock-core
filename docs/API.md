@@ -1,7 +1,8 @@
 # API reference
 
-The same operations exist in three forms. Rust `openadblock_engine::api` is the source of truth;
-Java (`bindings/java`) and C (`crates/ffi/include/openadblock.h`) mirror it one to one.
+The same operations exist in several forms. Rust `openadblock_engine::api` is the source of truth;
+Java (`bindings/java`), C (`crates/ffi/include/openadblock.h`) and Swift (`bindings/swift`, the
+same protocols as Java over the C ABI) mirror it one to one.
 
 | Operation | Java (`AdBlockEngine`) | C | Rust `api::` |
 | --- | --- | --- | --- |

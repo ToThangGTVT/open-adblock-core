@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 — Swift binding
+
+- `bindings/swift`: Swift package `OpenAdBlockCore` with the Java API's protocols
+  (`AdBlockEngine`, `TunnelController`, …) over the C ABI; `NativeEngine.shared`.
+- `scripts/build-apple.sh` builds `COpenAdBlock.xcframework` for macOS.
+- CI runs the Swift tests on macOS.
+
 ## 0.6.0 — split from the Open AdBlock app
 
 - The Rust engine moves out of `open-adblock/nativecore` into this repository, with its history.

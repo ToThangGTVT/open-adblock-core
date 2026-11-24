@@ -21,6 +21,7 @@ crates/engine   openadblock-engine  Rust engine; `api` is the only surface bindi
 crates/jni      openadblock-jni     JNI library (libopenadblock_jni) for Android and desktop JVMs
 crates/ffi      openadblock-ffi     C ABI (libopenadblock) + include/openadblock.h for Swift, C#, C++
 bindings/java                       Java API: AdBlockEngine and its interfaces (no Android deps)
+bindings/swift                      Swift package OpenAdBlockCore: the same API as Swift protocols
 vendor/                             patched netstack-smoltcp
 scripts/                            build-android.sh, test-jvm.sh, test-c.sh, check-jni-exports.py
 docs/                               ARCHITECTURE.md, API.md, PLATFORMS.md
@@ -53,7 +54,18 @@ implementation("io.github.tothanggtvt.openadblock:openadblock-core")
 
 and package the native library with `scripts/build-android.sh app/src/main/jniLibs`.
 
-### Swift, C#, C++ (macOS, Windows, Linux)
+### Swift (macOS, later iOS)
+
+```bash
+scripts/build-apple.sh        # → bindings/swift/Artifacts/COpenAdBlock.xcframework
+```
+
+Add `bindings/swift` as a local Swift package and use `NativeEngine.shared` (an `AdBlockEngine`).
+A packet tunnel provider calls `startPackets(protector:dns:sink:)` and feeds
+`NEPacketTunnelFlow` packets with `send(packet:)`. The macOS app lives in
+[open-adblock-mac](https://github.com/ToThangGTVT/open-adblock-mac).
+
+### C#, C++ (Windows, Linux)
 
 Link `libopenadblock` (`cargo build --release -p openadblock-ffi`) and include
 `crates/ffi/include/openadblock.h`. Hosts without a TUN file descriptor (macOS
@@ -71,6 +83,7 @@ cargo test --locked --workspace -- --test-threads=1
 scripts/test-c.sh          # C header + ABI smoke test on the host
 scripts/test-jvm.sh        # Java API against the host JNI library (needs JDK 17+)
 scripts/build-android.sh out/jniLibs   # four ABIs, verifies every JNI export
+scripts/build-apple.sh && (cd bindings/swift && swift test)   # macOS only
 ```
 
 ## Versioning

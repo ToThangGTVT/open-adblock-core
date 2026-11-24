@@ -4,12 +4,15 @@
 | --- | --- | --- | --- | --- | --- |
 | Android 13+ | Java API (JNI) | TUN fd from `VpnService` | `VpnService.protect` | UID via `getConnectionOwnerUid` | **Shipping** (Open AdBlock app) |
 | Desktop JVM (macOS/Linux) | Java API (JNI) | fd or packet mode | host-specific | host-specific | Builds and passes `scripts/test-jvm.sh` |
-| macOS (Network Extension) | C ABI from Swift | packet mode (`NEPacketTunnelFlow`) | return `true` (extension sockets bypass the tunnel) | not available per packet; -1 | Engine builds and tests on macOS; host app not written |
+| macOS (Network Extension) | Swift package `OpenAdBlockCore` (C ABI) | packet mode (`NEPacketTunnelFlow`) | return `true` (extension sockets bypass the tunnel) | not available per packet; -1 | Swift binding tested; app in [open-adblock-mac](https://github.com/ToThangGTVT/open-adblock-mac) |
 | Linux | C ABI or JVM | TUN fd | `SO_MARK` + policy routing | `/proc/net` lookup | Engine builds and tests on Linux CI; host not written |
 | Windows | C ABI from C#/C++ | packet mode (Wintun) | bind to physical interface (`IP_UNICAST_IF`) | PID via `GetExtendedTcpTable` | **Not yet**: engine needs a Windows socket layer |
 | iOS | C ABI from Swift | packet mode | as macOS | -1 | Not yet: memory budget of the extension (50 MB) to verify |
 
-## macOS host sketch (Swift)
+## macOS host sketch (Swift, raw C ABI)
+
+The Swift package `bindings/swift` wraps all of this (`NativeEngine.shared.startPackets`); the
+sketch shows what happens underneath.
 
 ```swift
 final class Tunnel: NEPacketTunnelProvider {

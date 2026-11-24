@@ -32,6 +32,11 @@ jobs:
         run: scripts/test-c.sh
       - name: JVM smoke test
         run: scripts/test-jvm.sh
+      - name: Swift binding
+        if: runner.os == 'macOS'
+        run: |
+          scripts/build-apple.sh
+          cd bindings/swift && swift test
 
   android:
     runs-on: ubuntu-latest
