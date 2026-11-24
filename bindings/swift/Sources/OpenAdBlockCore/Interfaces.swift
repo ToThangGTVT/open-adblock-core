@@ -132,8 +132,19 @@ public struct RuleReport: Decodable, Equatable, Sendable {
     public struct LineError: Decodable, Equatable, Sendable {
         public var line: Int
         public var message: String
+
+        public init(line: Int, message: String) {
+            self.line = line
+            self.message = message
+        }
     }
     public var loaded: Int
     public var ignored: Int
     public var errors: [LineError]
+
+    public init(loaded: Int, ignored: Int, errors: [LineError]) {
+        self.loaded = loaded
+        self.ignored = ignored
+        self.errors = errors
+    }
 }
