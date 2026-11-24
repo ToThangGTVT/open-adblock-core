@@ -315,6 +315,30 @@ pub unsafe extern "C" fn oab_send_packet(data: *const u8, length: usize) -> bool
     api::send_packet(std::slice::from_raw_parts(data, length))
 }
 
+/// Opens the loopback app proxy (see docs/API.md#app-proxy). Writes the port and the
+/// NUL-terminated token (`token_capacity` must be at least 33). False when the tunnel is not
+/// running.
+#[no_mangle]
+pub unsafe extern "C" fn oab_open_app_proxy(
+    port: *mut u16,
+    token: *mut c_char,
+    token_capacity: usize,
+) -> bool {
+    if port.is_null() || token.is_null() {
+        return false;
+    }
+    let Some(endpoint) = api::open_app_proxy() else {
+        return false;
+    };
+    if token_capacity <= endpoint.token.len() {
+        return false;
+    }
+    *port = endpoint.port;
+    std::ptr::copy_nonoverlapping(endpoint.token.as_ptr().cast(), token, endpoint.token.len());
+    *token.add(endpoint.token.len()) = 0;
+    true
+}
+
 #[no_mangle]
 pub extern "C" fn oab_stop() {
     api::stop();

@@ -106,6 +106,9 @@ final class NativeEngineTests: XCTestCase {
         let sink = Collect()
         XCTAssertTrue(engine.startPackets(protector: Allow(), dns: nil, sink: sink))
         XCTAssertTrue(engine.isRunning)
+        let proxy = try XCTUnwrap(engine.openAppProxy())
+        XCTAssertEqual(proxy.token.count, 32)
+        XCTAssertEqual(engine.openAppProxy(), proxy)
         let payload = Array("ping from Swift".utf8)
         XCTAssertTrue(engine.send(packet: ipv4UDP(source: 40000, destination: port, payload: payload)))
         var echoed: [UInt8]?
@@ -121,6 +124,7 @@ final class NativeEngineTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(engine.counters.udpOpened, 1)
         engine.stop()
         XCTAssertFalse(engine.isRunning)
+        XCTAssertNil(engine.openAppProxy())
         XCTAssertEqual(engine.counters, TrafficCounters())
 
         // Root CA with a CryptoKit key the engine never sees.

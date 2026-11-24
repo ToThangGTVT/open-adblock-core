@@ -76,6 +76,14 @@ public final class NativeEngine implements AdBlockEngine {
         return NativeBindings.sendPacket(packet, offset, length);
     }
 
+    @Override
+    public AppProxyEndpoint openAppProxy() {
+        String value = NativeBindings.openAppProxy();
+        if (value == null) return null;
+        int space = value.indexOf(' ');
+        return new AppProxyEndpoint(Integer.parseInt(value.substring(0, space)), value.substring(space + 1));
+    }
+
     @Override public void stop() { NativeBindings.stop(); }
 
     @Override

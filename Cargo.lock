@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "openadblock-engine"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "adblock",
  "async-compression",
@@ -1282,14 +1282,14 @@ dependencies = [
 
 [[package]]
 name = "openadblock-ffi"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "openadblock-engine",
 ]
 
 [[package]]
 name = "openadblock-jni"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "jni 0.21.1",
  "openadblock-engine",

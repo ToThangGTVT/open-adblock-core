@@ -34,6 +34,11 @@ int main(void) {
     CHECK(oab_is_running());
     CHECK(!oab_start_packets(&protector, "", &sink)); /* already running: both released */
     CHECK(released == 2);
+    uint16_t proxy_port = 0;
+    char token[OAB_APP_PROXY_TOKEN_LENGTH + 1];
+    CHECK(oab_open_app_proxy(&proxy_port, token, sizeof token));
+    CHECK(proxy_port != 0 && strlen(token) == OAB_APP_PROXY_TOKEN_LENGTH);
+    CHECK(!oab_open_app_proxy(&proxy_port, token, OAB_APP_PROXY_TOKEN_LENGTH));
     uint8_t junk[20] = {0x45};
     CHECK(oab_send_packet(junk, sizeof junk));
     oab_stop();

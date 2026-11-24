@@ -273,6 +273,18 @@ pub extern "system" fn Java_io_github_tothanggtvt_openadblock_core_NativeBinding
     flag(api::send_packet(bytes))
 }
 
+/// `"<port> <token>"`, or null when the tunnel is not running.
+#[no_mangle]
+pub extern "system" fn Java_io_github_tothanggtvt_openadblock_core_NativeBindings_openAppProxy(
+    mut env: JNIEnv,
+    _: JClass,
+) -> jstring {
+    match api::open_app_proxy() {
+        Some(endpoint) => new_string(&mut env, &format!("{} {}", endpoint.port, endpoint.token)),
+        None => std::ptr::null_mut(),
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_io_github_tothanggtvt_openadblock_core_NativeBindings_stop(
     _: JNIEnv,

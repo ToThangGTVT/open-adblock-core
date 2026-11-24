@@ -40,6 +40,14 @@ public interface TunnelController {
         return sendPacket(packet, 0, packet.length);
     }
 
+    /**
+     * Opens the loopback listener through which the host hands over TCP streams it intercepts per
+     * app, so they get the tunnel's filtering and HTTPS decryption ({@code docs/API.md#app-proxy}).
+     *
+     * @return the endpoint, or {@code null} when the tunnel is not running
+     */
+    AppProxyEndpoint openAppProxy();
+
     /** Stops the tunnel, joins its thread and closes the descriptor. Idempotent. */
     void stop();
 

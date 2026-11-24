@@ -58,7 +58,6 @@ pub async fn serve(
                 }
                 let Some(destination) = network.borrow().destination(destination) else { continue; };
                 let protector = protector.clone();
-                let mut https_changes = crate::mitm::subscribe();
                 let stats = stats.clone();
                 let resets = resets.clone(); let raw = raw.clone();
                 flows.spawn(async move {
@@ -69,65 +68,152 @@ pub async fn serve(
                         if let Some(packet) = resets.packet(source, destination) { let _ = raw.send(packet).await; }
                         return;
                     }
-                    let activity = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
-                    let mut client = CountedStream { inner: client, stats: stats.clone(), activity: activity.clone() };
-                    let (initial, parsed) = if owner.bypass { (vec![], sniff::Parsed::Unknown) } else { sniff::read_initial(&mut client).await };
-                    let (domain, url, protocol) = match &parsed {
-                        sniff::Parsed::Tls(host) => (host.clone(), None, "tls"),
-                        sniff::Parsed::Http { host, url } => (host.clone(), Some(url.as_str()), "http"),
-                        _ => (crate::dns::reverse::lookup(owner.uid, destination.ip()).unwrap_or_else(|| destination.ip().to_string()), None, "tcp"),
-                    };
-                    let decision = if owner.bypass { None } else { crate::filter::current().matches(&domain, url, &owner.packages) };
-                    let blocked = decision.as_ref().is_some_and(|d| d.blocked);
-                    crate::dns::event(domain.clone(), blocked, decision.map(|d| d.rule), false, owner.uid, protocol);
-                    if blocked {
-                        if matches!(parsed, sniff::Parsed::Http { .. }) { let _ = client.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await; let _ = client.shutdown().await; }
-                        else if let Some(packet) = resets.packet(source, destination) { let _ = raw.send(packet).await; }
-                        return;
-                    }
-
-                    if matches!(parsed, sniff::Parsed::Tls(_)) && matches!(destination.port(), 443 | 8443) && crate::mitm::eligible(&domain, &owner) {
-                        if let Ok(config) = crate::mitm::proxy::prepare(&domain).await {
-                            if crate::mitm::eligible(&domain, &owner) {
-                                match crate::mitm::proxy::upstream(destination, &domain, protector.as_ref(), &stats).await {
-                                    Ok(upstream) => {
-                                        let idle = idle_timeout(activity.clone());
-                                        tokio::select! { _ = crate::mitm::proxy::serve(client, config, initial, crate::mitm::proxy::VerifiedUpstream::new(upstream, crate::mitm::proxy::connector(destination, domain.clone(), protector.clone(), stats.clone())), domain, destination, owner) => {}, _ = idle => {} }
-                                        return;
-                                    }
-                                    Err(_) => crate::dns::event(domain.clone(), false, Some("Bỏ qua HTTPS · upstream TLS không xác minh được; chuyển relay TLS cho app".into()), false, owner.uid, "tls-bypass"),
-                                }
-                            }
-                        }
-                    }
-                    let selected = crate::mitm::current().apps.iter().any(|app| owner.packages.contains(app));
-                    let tls = matches!(parsed, sniff::Parsed::Tls(_)) && matches!(destination.port(), 443 | 8443) && !owner.bypass;
-                    if let Ok(upstream) = sockets::connect_tcp(destination, protector.as_ref(), &stats).await {
-                        // GoodbyeDPI-style tricks on the first request (and keep-alive HTTP requests).
-                        // Bypassed apps are never sniffed, so never touched.
-                        let desync = crate::dpi::enabled() && !owner.bypass && !matches!(parsed, sniff::Parsed::Unknown);
-                        let host = match &parsed { sniff::Parsed::Tls(h) | sniff::Parsed::Http { host: h, .. } => Some(h.clone()), _ => None };
-                        let mut upstream = crate::dpi::Desync::new(upstream, host, desync);
-                        if upstream.write_all(&initial).await.is_err() || upstream.flush().await.is_err() { return; }
-                        let idle = idle_timeout(activity.clone());
-                        let relay = tokio::io::copy_bidirectional(&mut client, &mut upstream);
-                        tokio::pin!(relay, idle);
-                        loop {
-                            tokio::select! {
-                                _ = &mut relay => break,
-                                _ = &mut idle => break,
-                                changed = https_changes.changed(), if tls => {
-                                    if changed.is_err() || selected || crate::mitm::current().apps.iter().any(|app| owner.packages.contains(app)) { break; }
-                                }
-                            }
-                        }
-                    }
+                    relay(client, destination, owner, protector, stats, Refusal::Reset { resets, source, raw }).await;
                 });
             }
         }
     }
     flows.abort_all();
     while flows.join_next().await.is_some() {}
+}
+
+/// How a blocked non-HTTP flow is refused: a TCP RST injected into the tunnel, or simply closing
+/// a stream a host handed over (`app_proxy`).
+pub(crate) enum Refusal {
+    Reset {
+        resets: Arc<reset::Resets>,
+        source: std::net::SocketAddr,
+        raw: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+    Close,
+}
+impl Refusal {
+    async fn refuse(&self, destination: std::net::SocketAddr) {
+        if let Self::Reset {
+            resets,
+            source,
+            raw,
+        } = self
+        {
+            if let Some(packet) = resets.packet(*source, destination) {
+                let _ = raw.send(packet).await;
+            }
+        }
+    }
+}
+
+/// Filters one TCP flow: sniffs SNI/HTTP, applies the rules, decrypts eligible HTTPS, otherwise
+/// relays to `destination` over a protected socket. Shared by the tunnel and `app_proxy`.
+pub(crate) async fn relay<S>(
+    client: S,
+    destination: std::net::SocketAddr,
+    owner: crate::policy::Owner,
+    protector: Arc<dyn Protector>,
+    stats: Arc<Stats>,
+    refusal: Refusal,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut https_changes = crate::mitm::subscribe();
+    let activity = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let mut client = CountedStream {
+        inner: client,
+        stats: stats.clone(),
+        activity: activity.clone(),
+    };
+    let (initial, parsed) = if owner.bypass {
+        (vec![], sniff::Parsed::Unknown)
+    } else {
+        sniff::read_initial(&mut client).await
+    };
+    let (domain, url, protocol) = match &parsed {
+        sniff::Parsed::Tls(host) => (host.clone(), None, "tls"),
+        sniff::Parsed::Http { host, url } => (host.clone(), Some(url.as_str()), "http"),
+        _ => (
+            crate::dns::reverse::lookup(owner.uid, destination.ip())
+                .unwrap_or_else(|| destination.ip().to_string()),
+            None,
+            "tcp",
+        ),
+    };
+    let decision = if owner.bypass {
+        None
+    } else {
+        crate::filter::current().matches(&domain, url, &owner.packages)
+    };
+    let blocked = decision.as_ref().is_some_and(|d| d.blocked);
+    crate::dns::event(
+        domain.clone(),
+        blocked,
+        decision.map(|d| d.rule),
+        false,
+        owner.uid,
+        protocol,
+    );
+    if blocked {
+        if matches!(parsed, sniff::Parsed::Http { .. }) {
+            let _ = client
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
+            let _ = client.shutdown().await;
+        } else {
+            refusal.refuse(destination).await;
+        }
+        return;
+    }
+
+    if matches!(parsed, sniff::Parsed::Tls(_))
+        && matches!(destination.port(), 443 | 8443)
+        && crate::mitm::eligible(&domain, &owner)
+    {
+        if let Ok(config) = crate::mitm::proxy::prepare(&domain).await {
+            if crate::mitm::eligible(&domain, &owner) {
+                match crate::mitm::proxy::upstream(destination, &domain, protector.as_ref(), &stats).await {
+                    Ok(upstream) => {
+                        let idle = idle_timeout(activity.clone());
+                        tokio::select! { _ = crate::mitm::proxy::serve(client, config, initial, crate::mitm::proxy::VerifiedUpstream::new(upstream, crate::mitm::proxy::connector(destination, domain.clone(), protector.clone(), stats.clone())), domain, destination, owner) => {}, _ = idle => {} }
+                        return;
+                    }
+                    Err(_) => crate::dns::event(domain.clone(), false, Some("Bỏ qua HTTPS · upstream TLS không xác minh được; chuyển relay TLS cho app".into()), false, owner.uid, "tls-bypass"),
+                }
+            }
+        }
+    }
+    let selected = crate::mitm::current()
+        .apps
+        .iter()
+        .any(|app| owner.packages.contains(app));
+    let tls = matches!(parsed, sniff::Parsed::Tls(_))
+        && matches!(destination.port(), 443 | 8443)
+        && !owner.bypass;
+    if let Ok(upstream) = sockets::connect_tcp(destination, protector.as_ref(), &stats).await {
+        // GoodbyeDPI-style tricks on the first request (and keep-alive HTTP requests).
+        // Bypassed apps are never sniffed, so never touched.
+        let desync =
+            crate::dpi::enabled() && !owner.bypass && !matches!(parsed, sniff::Parsed::Unknown);
+        let host = match &parsed {
+            sniff::Parsed::Tls(h) | sniff::Parsed::Http { host: h, .. } => Some(h.clone()),
+            _ => None,
+        };
+        let mut upstream = crate::dpi::Desync::new(upstream, host, desync);
+        if upstream.write_all(&initial).await.is_err() || upstream.flush().await.is_err() {
+            return;
+        }
+        let idle = idle_timeout(activity.clone());
+        let relay = tokio::io::copy_bidirectional(&mut client, &mut upstream);
+        tokio::pin!(relay, idle);
+        loop {
+            tokio::select! {
+                _ = &mut relay => break,
+                _ = &mut idle => break,
+                changed = https_changes.changed(), if tls => {
+                    if changed.is_err() || selected || crate::mitm::current().apps.iter().any(|app| owner.packages.contains(app)) { break; }
+                }
+            }
+        }
+    }
 }
 
 struct CountedStream<S> {

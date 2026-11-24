@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 — app proxy
+
+- `open_app_proxy` / `openAppProxy` / `oab_open_app_proxy`: a loopback listener (random token)
+  through which a host hands over TCP streams it intercepts per app. Streams get the same rules
+  and HTTPS decryption as tunnelled TCP; the macOS app uses it to filter browsers only.
+- `tcp::relay`: the per-flow logic shared by the tunnel and the app proxy.
+
 ## 0.6.1 — Swift binding
 
 - `bindings/swift`: Swift package `OpenAdBlockCore` with the Java API's protocols

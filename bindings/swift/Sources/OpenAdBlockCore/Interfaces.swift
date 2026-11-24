@@ -53,6 +53,9 @@ public protocol TunnelController {
     /// Queues one packet read from the virtual interface; `false` when not running in packet
     /// mode or the queue is full (the packet is dropped).
     @discardableResult func send(packet: Data) -> Bool
+    /// Loopback listener for TCP streams the host intercepts per app (macOS transparent proxy);
+    /// `nil` when the tunnel is not running. Protocol: docs/API.md#app-proxy.
+    func openAppProxy() -> AppProxyEndpoint?
     func stop()
     /// Physical network changed: upstream sockets are dropped, new flows use `dns`.
     @discardableResult func updateNetwork(dns: String?) -> Bool
@@ -105,6 +108,24 @@ public protocol AdBlockEngine: TunnelController, FilterController, EngineConfigu
 
 /// The binding contract these Swift declarations were written against.
 public let openAdBlockAPIVersion: UInt32 = 1
+
+/// Where host-intercepted app streams go: per TCP connection to `127.0.0.1:port` send
+/// `"OAB1 <token> <host> <port> <app id>\n"`, then relay the app's bytes both ways.
+public struct AppProxyEndpoint: Equatable, Sendable {
+    public var port: UInt16
+    /// Random per tunnel run; keep it in-process.
+    public var token: String
+
+    public init(port: UInt16, token: String) {
+        self.port = port
+        self.token = token
+    }
+
+    /// The header line that opens a stream for `app` to `host`:`port`.
+    public func header(host: String, port: UInt16, app: String) -> Data {
+        Data("OAB1 \(token) \(host) \(port) \(app)\n".utf8)
+    }
+}
 
 /// Traffic counters since the tunnel started; zero while stopped.
 public struct TrafficCounters: Equatable, Sendable {

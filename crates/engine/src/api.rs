@@ -168,6 +168,18 @@ pub fn is_running() -> bool {
         .is_some_and(|running| running.engine.running.load(Ordering::Acquire))
 }
 
+pub use crate::app_proxy::Endpoint as AppProxyEndpoint;
+
+/// Opens the loopback listener through which a host hands over TCP streams it intercepts per
+/// application (macOS transparent proxy), so they get the same filtering and HTTPS decryption
+/// as tunnelled traffic. Idempotent while the tunnel runs; `None` when it is not running.
+/// Protocol: `docs/API.md#app-proxy`.
+pub fn open_app_proxy() -> Option<AppProxyEndpoint> {
+    engine()
+        .as_ref()
+        .and_then(|running| running.engine.open_app_proxy().ok())
+}
+
 /// Traffic counters since `start`, named by [`COUNTER_NAMES`]. Zero when stopped.
 pub fn counters() -> [i64; 8] {
     engine()

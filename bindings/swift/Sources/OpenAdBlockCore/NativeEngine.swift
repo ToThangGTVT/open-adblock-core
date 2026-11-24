@@ -39,6 +39,13 @@ public final class NativeEngine: AdBlockEngine, @unchecked Sendable {
         }
     }
 
+    public func openAppProxy() -> AppProxyEndpoint? {
+        var port: UInt16 = 0
+        var token = [CChar](repeating: 0, count: Int(OAB_APP_PROXY_TOKEN_LENGTH) + 1)
+        guard oab_open_app_proxy(&port, &token, token.count) else { return nil }
+        return AppProxyEndpoint(port: port, token: String(cString: token))
+    }
+
     public func stop() { oab_stop() }
 
     @discardableResult

@@ -54,6 +54,8 @@ public final class NativeEngineSmokeTest {
             LinkedBlockingQueue<byte[]> replies = new LinkedBlockingQueue<>();
             check(engine.startPackets(fd -> true, null, replies::add), "start packets");
             check(engine.isRunning(), "running");
+            AppProxyEndpoint proxy = engine.openAppProxy();
+            check(proxy != null && proxy.port() > 0 && proxy.token().length() == 32, "app proxy");
             byte[] payload = "ping from the JVM".getBytes(StandardCharsets.UTF_8);
             check(engine.sendPacket(ipv4Udp(40000, echo.getLocalPort(), payload)), "send packet");
             byte[] answer = null;

@@ -90,6 +90,10 @@ bool oab_start_packets(const OabSocketProtector *protector, const char *dns,
                        const OabPacketSink *sink);
 /* False when not in packet mode or the queue is full (the packet is dropped). */
 bool oab_send_packet(const uint8_t *data, size_t length);
+/* Loopback listener for TCP streams the host intercepts per app (docs/API.md#app-proxy).
+ * Writes the port and the NUL-terminated token; false when the tunnel is not running. */
+#define OAB_APP_PROXY_TOKEN_LENGTH 32u
+bool oab_open_app_proxy(uint16_t *port, char *token, size_t token_capacity);
 void oab_stop(void);
 bool oab_update_network(const char *dns);
 bool oab_is_running(void);

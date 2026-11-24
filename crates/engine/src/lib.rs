@@ -9,6 +9,7 @@
 //! Bindings (JNI, C ABI) and hosts should call only [`api`]. The other modules are public for
 //! tests and benchmarks and carry no stability promise.
 pub mod api;
+pub mod app_proxy;
 pub mod dns;
 pub mod dpi;
 pub mod filter;

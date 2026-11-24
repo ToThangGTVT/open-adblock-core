@@ -166,6 +166,8 @@ pub struct Engine {
     network: watch::Sender<NetworkConfig>,
     thread: Option<JoinHandle<()>>,
     protector: Arc<dyn Protector>,
+    runtime: tokio::runtime::Handle,
+    app_proxy: std::sync::Mutex<Option<crate::app_proxy::Endpoint>>,
     pub running: Arc<AtomicBool>,
     pub stats: Arc<Stats>,
 }
@@ -189,6 +191,7 @@ impl Engine {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        let handle = runtime.handle().clone();
         let (stop_tx, stop_rx) = oneshot::channel();
         let (network_tx, network_rx) = watch::channel(config);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -314,6 +317,8 @@ impl Engine {
             network: network_tx,
             thread: Some(thread),
             protector: engine_protector,
+            runtime: handle,
+            app_proxy: std::sync::Mutex::new(None),
             running,
             stats,
         };
@@ -351,6 +356,26 @@ impl Engine {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         false
+    }
+    /// Opens (once) the loopback listener for host-intercepted app streams, see `app_proxy`.
+    /// It lives as long as the tunnel runtime.
+    pub fn open_app_proxy(&self) -> io::Result<crate::app_proxy::Endpoint> {
+        let mut slot = self.app_proxy.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(endpoint) = slot.as_ref() {
+            return Ok(endpoint.clone());
+        }
+        if !self.running.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::NotConnected.into());
+        }
+        let (listener, endpoint) = crate::app_proxy::bind()?;
+        self.runtime.spawn(crate::app_proxy::serve(
+            listener,
+            endpoint.token.clone(),
+            self.protector.clone(),
+            self.stats.clone(),
+        ));
+        *slot = Some(endpoint.clone());
+        Ok(endpoint)
     }
     pub fn shutdown(&mut self) {
         if let Some(stop) = self.stop.take() {

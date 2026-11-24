@@ -17,6 +17,8 @@ final class NativeBindings {
 
     static native boolean sendPacket(byte[] packet, int offset, int length);
 
+    static native String openAppProxy();
+
     static native void stop();
 
     static native boolean updateNetwork(String dns);

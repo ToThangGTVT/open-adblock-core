@@ -11,6 +11,7 @@ same protocols as Java over the C ABI) mirror it one to one.
 | Start on TUN fd | `start(fd, protector, dns)` | `oab_start_fd` | `start_fd` |
 | Start, host packets | `startPackets(protector, dns, sink)` | `oab_start_packets` | `start_packets` |
 | Feed one packet | `sendPacket(bytes)` | `oab_send_packet` | `send_packet` |
+| App proxy | `openAppProxy()` | `oab_open_app_proxy` | `open_app_proxy` |
 | Stop | `stop()` | `oab_stop` | `stop` |
 | Network changed | `updateNetwork(dns)` | `oab_update_network` | `update_network` |
 | Running? | `isRunning()` | `oab_is_running` | `is_running` |
@@ -26,6 +27,23 @@ same protocols as Java over the C ABI) mirror it one to one.
 
 `dns` arguments are an IP literal for the plain resolver the virtual DNS address forwards to
 (an IPv6 `%zone` suffix is ignored); empty/`null` means none.
+
+## App proxy
+
+For hosts that can intercept TCP connections per application but not per packet — the macOS
+`NETransparentProxyProvider` sees each flow's app (`sourceAppSigningIdentifier`) — the engine
+opens a loopback listener while the tunnel runs. Per intercepted connection the host:
+
+1. connects to `127.0.0.1:<port>` (from `openAppProxy`);
+2. sends one line: `OAB1 <token> <destination IP or host> <destination port> <app id>\n`;
+3. copies the app's bytes to that socket and the socket's bytes back to the app, until either
+   side closes.
+
+The engine then treats the stream like tunnelled TCP: rules (a blocked TLS stream is closed, a
+blocked HTTP request gets `204`), HTTPS decryption when `<app id>` is listed in
+`configureHttps.apps` and a root CA is set, otherwise a relay over a protected socket. The token
+is random per tunnel run (32 hex characters); a wrong header closes the connection. Each app id
+gets its own stable owner id (high bit set) for the HTTPS bypass cache and events.
 
 ## Callbacks
 
