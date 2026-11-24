@@ -179,38 +179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blockads-core"
-version = "0.5.0"
-dependencies = [
- "adblock",
- "async-compression",
- "base64",
- "bytes",
- "etherparse",
- "futures-util",
- "hickory-resolver",
- "http-body-util",
- "hyper",
- "hyper-util",
- "jni 0.21.1",
- "libc",
- "netstack-smoltcp",
- "quinn",
- "rcgen",
- "regex",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "socket2",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "webpki-roots",
-]
-
-[[package]]
 name = "brotli"
 version = "9.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1279,6 +1247,52 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 dependencies = [
  "critical-section",
  "portable-atomic",
+]
+
+[[package]]
+name = "openadblock-engine"
+version = "0.6.0"
+dependencies = [
+ "adblock",
+ "async-compression",
+ "base64",
+ "bytes",
+ "etherparse",
+ "futures-util",
+ "hickory-resolver",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "netstack-smoltcp",
+ "quinn",
+ "rcgen",
+ "regex",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "webpki-roots",
+]
+
+[[package]]
+name = "openadblock-ffi"
+version = "0.6.0"
+dependencies = [
+ "openadblock-engine",
+]
+
+[[package]]
+name = "openadblock-jni"
+version = "0.6.0"
+dependencies = [
+ "jni 0.21.1",
+ "openadblock-engine",
 ]
 
 [[package]]

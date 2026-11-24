@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Rust checks
+        run: |
+          rustup show
+          cargo fmt --all --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace -- --test-threads=1
+      - name: C ABI smoke test
+        run: scripts/test-c.sh
+      - name: JVM smoke test
+        run: scripts/test-jvm.sh
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
+      - run: sdkmanager 'ndk;28.2.13676358'
+      - name: Build four ABIs and verify JNI exports
+        run: scripts/build-android.sh out/jniLibs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jniLibs
+          path: out/jniLibs

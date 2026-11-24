@@ -1,0 +1,16 @@
+[package]
+name = "openadblock-jni"
+description = "JNI binding of the Open AdBlock engine for Android and desktop JVMs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "openadblock_jni"
+crate-type = ["cdylib"]
+
+[dependencies]
+openadblock-engine.workspace = true
+jni = { version = "=0.21.1", default-features = false }

@@ -1,0 +1,15 @@
+[package]
+name = "openadblock-ffi"
+description = "C ABI of the Open AdBlock engine for Swift (macOS/iOS), C#/C++ (Windows) and other native hosts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "openadblock"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+openadblock-engine.workspace = true
