@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- HTTPS filtering relays WebSockets. An HTTP/1.1 `Upgrade: websocket` handshake goes to the
+  origin over its own HTTP/1.1 connection and both upgraded streams are copied after the `101`;
+  network rules (`$websocket`) apply to the handshake URL. Before, the first socket to each host
+  got `501` and the host was bypassed, which broke chat sites such as Zalo Web on first load.
+- `proxy::Connector` takes `http1_only` (the ALPN offer for that connection).
+
 ## 0.7.0 — app proxy
 
 - `open_app_proxy` / `openAppProxy` / `oab_open_app_proxy`: a loopback listener (random token)

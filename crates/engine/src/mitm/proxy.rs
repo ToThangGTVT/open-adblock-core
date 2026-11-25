@@ -38,8 +38,13 @@ enum Sender {
     H1(hyper::client::conn::http1::SendRequest<Body>),
     H2(hyper::client::conn::http2::SendRequest<Body>),
 }
+/// Opens a new verified upstream connection. With `http1_only` the ALPN offer is `http/1.1`
+/// alone: WebSocket handshakes need an HTTP/1.1 connection of their own (RFC 6455).
 pub type Connector = Arc<
-    dyn Fn() -> BoxFuture<'static, io::Result<TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>>>
+    dyn Fn(
+            bool,
+        )
+            -> BoxFuture<'static, io::Result<TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>>>
         + Send
         + Sync,
 >;
@@ -113,6 +118,15 @@ pub async fn upstream(
     protector: &dyn Protector,
     stats: &Arc<Stats>,
 ) -> io::Result<TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>> {
+    connect_upstream(destination, domain, protector, stats, false).await
+}
+async fn connect_upstream(
+    destination: SocketAddr,
+    domain: &str,
+    protector: &dyn Protector,
+    stats: &Arc<Stats>,
+    http1_only: bool,
+) -> io::Result<TlsStream<crate::dpi::Desync<tokio::net::TcpStream>>> {
     let raw = crate::dpi::Desync::new(
         sockets::connect_tcp(destination, protector, stats).await?,
         Some(domain.to_owned()),
@@ -127,7 +141,11 @@ pub async fn upstream(
     .map_err(io::Error::other)?
     .with_root_certificates(roots)
     .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = if http1_only {
+        vec![b"http/1.1".to_vec()]
+    } else {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    };
     let name =
         rustls::pki_types::ServerName::try_from(domain.to_owned()).map_err(io::Error::other)?;
     tokio::time::timeout(
@@ -142,9 +160,11 @@ pub fn connector(
     protector: Arc<dyn Protector>,
     stats: Arc<Stats>,
 ) -> Connector {
-    Arc::new(move || {
+    Arc::new(move |http1_only| {
         let (domain, protector, stats) = (domain.clone(), protector.clone(), stats.clone());
-        Box::pin(async move { upstream(destination, &domain, protector.as_ref(), &stats).await })
+        Box::pin(async move {
+            connect_upstream(destination, &domain, protector.as_ref(), &stats, http1_only).await
+        })
     })
 }
 async fn connection(
@@ -203,7 +223,7 @@ async fn send_upstream(
             Sender::H2(sender) => sender.ready().await,
         };
         if reconnect || ready.is_err() {
-            let tls = (upstream.reconnect)().await?;
+            let tls = (upstream.reconnect)(false).await?;
             let (sender, driver) = connection(tls, domain.to_owned(), uid).await?;
             state.drivers.retain(|driver| !driver.0.is_finished());
             state.drivers.push(driver);
@@ -423,7 +443,8 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         builder
             .max_buf_size(MAX_HEADER_LIST_SIZE as usize)
             .max_headers(100);
-        tokio::select! {result=builder.serve_connection(TokioIo::new(client),service)=>finish(result)?,_=revision.changed()=>{}}
+        // Upgrades: a WebSocket hands the browser's TLS stream to its own task (`websocket`).
+        tokio::select! {result=builder.serve_connection(TokioIo::new(client),service).with_upgrades()=>finish(result)?,_=revision.changed()=>{}}
     }
     Ok(())
 }
@@ -450,8 +471,9 @@ async fn forward(
     if !authority.eq_ignore_ascii_case(domain) || !eligible(domain, owner) {
         return empty(StatusCode::MISDIRECTED_REQUEST);
     }
+    let websocket = is_websocket(&request);
     if request.method() == hyper::Method::CONNECT
-        || request.headers().contains_key(hyper::header::UPGRADE)
+        || (request.headers().contains_key(hyper::header::UPGRADE) && !websocket)
     {
         super::bypass(domain, owner, "HTTP Upgrade/CONNECT chưa hỗ trợ");
         return empty(StatusCode::NOT_IMPLEMENTED);
@@ -472,7 +494,8 @@ async fn forward(
     }) {
         return generic_css(domain, query);
     }
-    let url = format!("https://{authority}{path}");
+    let scheme = if websocket { "wss" } else { "https" };
+    let url = format!("{scheme}://{authority}{path}");
     let rules = crate::filter::current();
     let (kind, source) = request_context(request.headers(), &url);
     let context = crate::filter::Context {
@@ -500,6 +523,9 @@ async fn forward(
             .as_deref()
             .and_then(|data| resource_response(data, request.headers()))
             .unwrap_or_else(|| empty(StatusCode::NO_CONTENT));
+    }
+    if websocket {
+        return websocket_upgrade(request, &upstream, domain, &authority, &path, owner.uid).await;
     }
     // `$removeparam`: forward without the tracking parameters. Same origin only.
     let origin = format!("https://{authority}");
@@ -570,6 +596,107 @@ async fn forward(
             empty(StatusCode::GATEWAY_TIMEOUT)
         }
     }
+}
+/// An HTTP/1.1 WebSocket opening handshake (RFC 6455 §4.1). HTTP/2 WebSockets (RFC 8441
+/// extended CONNECT) are not offered: the proxy never sends SETTINGS_ENABLE_CONNECT_PROTOCOL,
+/// so browsers open an HTTP/1.1 connection for them.
+fn is_websocket(request: &Request<Incoming>) -> bool {
+    let has_token = |name: hyper::header::HeaderName, token: &str| {
+        request.headers().get_all(name).iter().any(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(token))
+            })
+        })
+    };
+    request.method() == hyper::Method::GET
+        && request.version() == hyper::Version::HTTP_11
+        && has_token(hyper::header::UPGRADE, "websocket")
+        && has_token(hyper::header::CONNECTION, "upgrade")
+}
+/// Relays an allowed WebSocket: the handshake goes to the origin over a dedicated HTTP/1.1
+/// connection; after its `101` both upgraded streams are copied to each other until either side
+/// closes. Frames are not inspected; the rules already decided on the handshake URL.
+async fn websocket_upgrade(
+    mut request: Request<Incoming>,
+    upstream: &Upstream,
+    domain: &str,
+    authority: &str,
+    path: &str,
+    uid: Option<u32>,
+) -> Response<Body> {
+    let client_upgrade = hyper::upgrade::on(&mut request);
+    let (parts, _) = request.into_parts();
+    let mut headers = parts.headers;
+    let upgrade = headers.get(hyper::header::UPGRADE).cloned();
+    clean_headers(&mut headers);
+    let (Some(upgrade), Ok(host), Ok(uri)) = (
+        upgrade,
+        hyper::header::HeaderValue::from_str(authority),
+        path.parse::<Uri>(),
+    ) else {
+        return empty(StatusCode::BAD_REQUEST);
+    };
+    headers.insert(hyper::header::HOST, host);
+    headers.insert(hyper::header::UPGRADE, upgrade);
+    headers.insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("upgrade"),
+    );
+    let mut outgoing = Request::new(
+        Empty::<Bytes>::new()
+            .map_err(|never: Infallible| match never {})
+            .boxed_unsync(),
+    );
+    *outgoing.method_mut() = hyper::Method::GET;
+    *outgoing.uri_mut() = uri;
+    *outgoing.version_mut() = hyper::Version::HTTP_11;
+    *outgoing.headers_mut() = headers;
+    let handshake = async {
+        let tls = (upstream.reconnect)(true).await?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(tls)).await?;
+        let report = domain.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = connection.with_upgrades().await {
+                report_error(&report, uid, "upstream WebSocket", &error);
+            }
+        });
+        Ok::<_, BoxError>(sender.send_request(outgoing).await?)
+    };
+    let mut response = match tokio::time::timeout(Duration::from_secs(30), handshake).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            report_error(domain, uid, "WebSocket handshake", error.as_ref());
+            return empty(StatusCode::BAD_GATEWAY);
+        }
+        Err(_) => return empty(StatusCode::GATEWAY_TIMEOUT),
+    };
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let server_upgrade = hyper::upgrade::on(&mut response);
+        let report = domain.to_owned();
+        tokio::spawn(async move {
+            match tokio::join!(client_upgrade, server_upgrade) {
+                (Ok(client), Ok(server)) => {
+                    let (mut client, mut server) = (TokioIo::new(client), TokioIo::new(server));
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    report_error(&report, uid, "WebSocket upgrade", &error)
+                }
+            }
+        });
+        // Keep Connection/Upgrade (hop-by-hop, but they are the 101's meaning) and the
+        // Sec-WebSocket-* answers the browser verifies.
+        let (parts, _) = response.into_parts();
+        let mut switched = empty(StatusCode::SWITCHING_PROTOCOLS);
+        *switched.headers_mut() = parts.headers;
+        return switched;
+    }
+    // A refused handshake (401, 403, 404, …) reaches the browser as it is.
+    clean_headers(response.headers_mut());
+    response.map(|body| body.map_err(|e| -> BoxError { Box::new(e) }).boxed_unsync())
 }
 /// Answers a blocked request with a `data:` URL resource from adblock-rust.
 fn resource_response(data: &str, request: &hyper::HeaderMap) -> Option<Response<Body>> {
@@ -698,6 +825,7 @@ fn request_context(headers: &hyper::HeaderMap, url: &str) -> (&'static str, Stri
         Some("audio" | "video" | "track") => "media",
         Some("object" | "embed") => "object",
         Some("report") => "csp_report",
+        Some("websocket") => "websocket",
         Some("empty") if header("sec-fetch-mode") == Some("websocket") => "websocket",
         Some("empty") => "xmlhttprequest",
         Some(_) => "other",
