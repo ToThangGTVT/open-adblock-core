@@ -86,7 +86,7 @@ fn test_connector(
     guard: Arc<Guard>,
     stats: Arc<Stats>,
 ) -> proxy::Connector {
-    Arc::new(move || {
+    Arc::new(move |_http1_only| {
         let (domain, config, guard, stats) =
             (domain.clone(), config.clone(), guard.clone(), stats.clone());
         Box::pin(async move {
@@ -187,7 +187,7 @@ async fn only_certificate_alerts_bypass_an_abandoned_handshake_does_not() {
             Arc::new(Guard(AtomicUsize::new(0))),
             Arc::new(Stats::default()),
         );
-        let upstream = connector().await.unwrap();
+        let upstream = connector(false).await.unwrap();
         let (mut front, back) = tokio::io::duplex(65536);
         let proxy = tokio::spawn(proxy::serve(
             back,
@@ -644,6 +644,167 @@ async fn http2_concurrent_streams_multiplex_over_one_upstream_connection() {
     ca::set(None, vec![]);
 }
 
+/// Browsers retry nothing after a failed WebSocket handshake: chat apps (Zalo, Slack, Discord)
+/// showed "disconnected" until the host was bypassed. The handshake now goes to the origin over
+/// its own HTTP/1.1 connection and the upgraded streams are relayed; rules still apply to the
+/// handshake URL and the host stays filtered.
+#[tokio::test]
+async fn websocket_handshake_is_relayed_and_filtered() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let domain = "socket.test".to_owned();
+    let (key, root) = root();
+    ca::set(Some(key), root.clone());
+    enable();
+    // Not `||host/…`: adblock-rust does not match that form against a URL with an explicit port,
+    // and this origin listens on a random one.
+    assert!(filter::replace("", "/blocked$websocket").applied);
+    let (peer_root, server_config) = peer_config(&domain, false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handshakes = Arc::new(AtomicUsize::new(0));
+    let seen = handshakes.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (raw, _) = listener.accept().await.unwrap();
+            let (server_config, seen) = (server_config.clone(), seen.clone());
+            tokio::spawn(async move {
+                let tls = TlsAcceptor::from(server_config).accept(raw).await.unwrap();
+                let service = hyper::service::service_fn(
+                    move |mut request: Request<hyper::body::Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            if !request.headers().contains_key("upgrade") {
+                                return Ok::<_, Infallible>(Response::new(Full::new(
+                                    Bytes::from_static(b"plain"),
+                                )));
+                            }
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(request.uri().path(), "/chat");
+                            assert_eq!(request.headers()["upgrade"], "websocket");
+                            assert_eq!(request.headers()["sec-websocket-key"], "dGhlIHNhbXBsZQ==");
+                            let upgrade = hyper::upgrade::on(&mut request);
+                            tokio::spawn(async move {
+                                let mut io = TokioIo::new(upgrade.await.unwrap());
+                                let mut buffer = [0u8; 64];
+                                while let Ok(read) = io.read(&mut buffer).await {
+                                    if read == 0 || io.write_all(&buffer[..read]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                            Ok(Response::builder()
+                                .status(StatusCode::SWITCHING_PROTOCOLS)
+                                .header("connection", "Upgrade")
+                                .header("upgrade", "websocket")
+                                .header("sec-websocket-accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap())
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(tls), service)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+    let stats = Arc::new(Stats::default());
+    let guard = Arc::new(Guard(AtomicUsize::new(0)));
+    let raw = sockets::connect_tcp(address, guard.as_ref(), &stats)
+        .await
+        .unwrap();
+    let verified = TlsConnector::from(client_config(&peer_root, false))
+        .connect(
+            ServerName::try_from(domain.clone()).unwrap(),
+            openadblock_engine::dpi::Desync::new(raw, None, false),
+        )
+        .await
+        .unwrap();
+    let (front, back) = tokio::io::duplex(65536);
+    let config = proxy::prepare(&domain).await.unwrap();
+    let proxy = tokio::spawn(proxy::serve(
+        back,
+        config,
+        vec![],
+        proxy::VerifiedUpstream::new(
+            verified,
+            test_connector(
+                address,
+                domain.clone(),
+                client_config(&peer_root, false),
+                guard.clone(),
+                stats.clone(),
+            ),
+        ),
+        domain.clone(),
+        address,
+        owner(),
+    ));
+    let tls = TlsConnector::from(client_config(&root, false))
+        .connect(ServerName::try_from(domain.clone()).unwrap(), front)
+        .await
+        .unwrap();
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+        .await
+        .unwrap();
+    let driver = tokio::spawn(async move {
+        let _ = connection.with_upgrades().await;
+    });
+    let handshake = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .header("Host", domain.as_str())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZQ==")
+            .header("Sec-Fetch-Dest", "websocket")
+            .header("Sec-Fetch-Mode", "websocket")
+            .header("Origin", format!("https://{domain}"))
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    };
+
+    // A rule on the handshake URL refuses the socket without contacting the origin.
+    sender.ready().await.unwrap();
+    let blocked = sender.send_request(handshake("/blocked")).await.unwrap();
+    assert_eq!(blocked.status(), StatusCode::NO_CONTENT);
+    assert_eq!(handshakes.load(Ordering::SeqCst), 0);
+
+    // An allowed socket is switched and relays bytes both ways.
+    sender.ready().await.unwrap();
+    let mut switched = sender.send_request(handshake("/chat")).await.unwrap();
+    assert_eq!(switched.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        switched.headers()["sec-websocket-accept"],
+        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    );
+    let mut socket = TokioIo::new(hyper::upgrade::on(&mut switched).await.unwrap());
+    for message in [&b"first frame"[..], b"second"] {
+        socket.write_all(message).await.unwrap();
+        let mut echoed = vec![0u8; message.len()];
+        tokio::time::timeout(Duration::from_secs(3), socket.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(echoed, message);
+    }
+    assert_eq!(handshakes.load(Ordering::SeqCst), 1);
+    // Supported now, so the host is not switched to bypass.
+    assert!(mitm::eligible(&domain, &owner()));
+
+    drop(socket);
+    driver.abort();
+    let _ = driver.await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), proxy).await;
+    server.abort();
+    let _ = server.await;
+    filter::replace("", "");
+    mitm::configure("{}");
+    ca::set(None, vec![]);
+}
+
 /// m.youtube.com answers with ~20 KiB of headers (report-only CSP and connection allowlist);
 /// signed-in browsers send large cookies. Both exceed hyper's 16 KiB default and used to end in
 /// a 502 from the proxy.
@@ -1034,7 +1195,7 @@ setTimeout(function () { var r = {}; ['g', 'k', 't', 't2', 'sponsor-x', 'late'].
             );
             let (domain, config) = (domain.clone(), config.clone());
             tokio::spawn(async move {
-                let upstream = connector().await.unwrap();
+                let upstream = connector(false).await.unwrap();
                 let _ = proxy::serve(
                     client,
                     config,
