@@ -72,6 +72,7 @@ default shown; unknown fields are ignored. Invalid JSON returns `false` and keep
   "bypassUids": [],           // app ids routed around filtering
   "blockedUids": [],          // app ids with no network at all (firewall); wins over bypass
   "packages": {"10123": ["com.example.app"]},   // app id → package/bundle names for HTTPS scope
+  "systemResolver": false,    // apps resolve through one system resolver (macOS): name IPs for all owners from one table
   "dpi": {
     "enabled": false, "httpSplit": 2, "httpsSplit": 2, "splitAtHost": true,
     "hostReplace": true, "hostRemoveSpace": true, "hostMixCase": false, "methodSpace": false,

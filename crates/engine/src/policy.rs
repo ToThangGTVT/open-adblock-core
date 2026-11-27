@@ -18,6 +18,11 @@ pub struct Options {
     pub bypass_uids: Vec<u32>,
     pub blocked_uids: Vec<u32>,
     pub packages: HashMap<u32, Vec<String>>,
+    /// Apps resolve names through one system resolver (macOS mDNSResponder), so the owner of a
+    /// DNS query is not the app that later connects. When set, IP→domain attribution uses one
+    /// table for every owner. Off by default: hosts that see each app's own queries (Android)
+    /// keep it per owner.
+    pub system_resolver: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -28,6 +33,7 @@ impl Default for Options {
             bypass_uids: vec![],
             blocked_uids: vec![],
             packages: HashMap::new(),
+            system_resolver: false,
         }
     }
 }
