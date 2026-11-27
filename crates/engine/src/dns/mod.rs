@@ -114,6 +114,9 @@ pub struct Event {
     pub cached: bool,
     pub uid: Option<u32>,
     pub protocol: String,
+    /// Path of an inspected HTTPS request (no query), cut to 2048 bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_preview: Option<RequestPreview>,
 }
@@ -209,18 +212,43 @@ pub fn event(
     uid: Option<u32>,
     protocol: &str,
 ) {
-    event_with_preview(domain, blocked, rule, cached, uid, protocol, None);
+    push(Event {
+        timestamp: 0,
+        domain,
+        blocked,
+        matched_rule: rule,
+        cached,
+        uid,
+        protocol: protocol.into(),
+        path: None,
+        request_preview: None,
+    });
 }
 
-pub(crate) fn event_with_preview(
+/// An HTTPS request the browser proxy inspected.
+pub(crate) fn request_event(
     domain: String,
     blocked: bool,
     rule: Option<String>,
-    cached: bool,
     uid: Option<u32>,
-    protocol: &str,
+    path: String,
     request_preview: Option<RequestPreview>,
 ) {
+    push(Event {
+        timestamp: 0,
+        domain,
+        blocked,
+        matched_rule: rule,
+        cached: false,
+        uid,
+        protocol: "https".into(),
+        path: Some(path),
+        request_preview,
+    });
+}
+
+/// Counts `event` in the totals and queues it for the sink when logging is on. Sets its timestamp.
+fn push(mut event: Event) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -232,11 +260,12 @@ pub(crate) fn event_with_preview(
             .unwrap_or_else(|e| e.into_inner());
         let entry = totals.entry(timestamp / 60000 * 60000).or_default();
         entry.0 += 1;
-        entry.1 += u64::from(blocked);
+        entry.1 += u64::from(event.blocked);
     }
     if !options().logging {
         return;
     }
+    event.timestamp = timestamp;
     let full = {
         let mut events = EVENTS
             .get_or_init(Mutex::default)
@@ -245,16 +274,7 @@ pub(crate) fn event_with_preview(
         if events.len() >= 4096 {
             events.remove(0);
         }
-        events.push(Event {
-            timestamp,
-            domain,
-            blocked,
-            matched_rule: rule,
-            cached,
-            uid,
-            protocol: protocol.into(),
-            request_preview,
-        });
+        events.push(event);
         events.len() >= 100
     };
     if full {
@@ -542,5 +562,31 @@ pub async fn serve_tcp<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::Event;
+
+    fn event(path: Option<&str>) -> serde_json::Value {
+        serde_json::to_value(Event {
+            timestamp: 1,
+            domain: "ads.example".into(),
+            blocked: true,
+            matched_rule: None,
+            cached: false,
+            uid: None,
+            protocol: "https".into(),
+            path: path.map(Into::into),
+            request_preview: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn path_is_sent_only_when_known() {
+        assert_eq!(event(Some("/ads.js"))["path"], "/ads.js");
+        assert!(event(None).get("path").is_none());
     }
 }

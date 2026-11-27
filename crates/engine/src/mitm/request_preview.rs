@@ -18,6 +18,7 @@ pub(super) struct Capture {
     uid: Option<u32>,
     blocked: bool,
     rule: Option<String>,
+    path: String,
     preview: Option<RequestPreview>,
     bytes: Vec<u8>,
     complete: bool,
@@ -31,10 +32,10 @@ impl Capture {
         blocked: bool,
         rule: Option<String>,
     ) -> Option<Self> {
+        let shortened = |value: &str| value[..value.floor_char_boundary(URL_LIMIT)].to_owned();
+        let path = request.uri().path();
         if let Some(session) = dns::capture_session(uid).filter(|_| dns::options().logging) {
-            let path = request.uri().path();
             let query = request.uri().query();
-            let shortened = |value: &str| value[..value.floor_char_boundary(URL_LIMIT)].to_owned();
             let preview = RequestPreview {
                 session,
                 method: request.method().as_str().to_owned(),
@@ -49,6 +50,7 @@ impl Capture {
                 uid,
                 blocked,
                 rule,
+                path: shortened(path),
                 preview: Some(preview),
                 bytes: Vec::new(),
                 complete: false,
@@ -59,7 +61,7 @@ impl Capture {
             // A blocked request may never send its body; do not drain it just to log it.
             drop(capture);
         } else {
-            dns::event(domain.into(), blocked, rule, false, uid, "https");
+            dns::request_event(domain.into(), blocked, rule, uid, shortened(path), None);
         }
         None
     }
@@ -90,13 +92,12 @@ impl Drop for Capture {
                 preview.body = utf8_preview(&self.bytes, preview.body_truncated).map(str::to_owned);
                 preview
             });
-        dns::event_with_preview(
+        dns::request_event(
             std::mem::take(&mut self.domain),
             self.blocked,
             self.rule.take(),
-            false,
             self.uid,
-            "https",
+            std::mem::take(&mut self.path),
             preview,
         );
     }

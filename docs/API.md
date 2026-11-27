@@ -115,7 +115,8 @@ Decryption also requires an installed root CA (`setRootCa`).
 {
   "events": [
     { "timestamp": 1764000000000, "domain": "ads.example", "blocked": true,
-      "matchedRule": "||ads.example^", "cached": false, "uid": 10123, "protocol": "dns",
+      "matchedRule": "||ads.example^", "cached": false, "uid": 10123, "protocol": "https",
+      "path": "/ads.js",
       "requestPreview": { "session": 1, "method": "GET", "path": "/", "query": null,
                           "body": null, "urlTruncated": false, "bodyTruncated": false } }
   ],
@@ -123,7 +124,8 @@ Decryption also requires an installed root CA (`setRootCa`).
 }
 ```
 
-`requestPreview` appears only during a request capture. `totals` are per-minute buckets.
+`path` (path only, no query, at most 2048 bytes) appears on `https` events for requests the
+browser proxy inspected. `requestPreview` appears only during a request capture. `totals` are per-minute buckets.
 
 ### Counters
 
