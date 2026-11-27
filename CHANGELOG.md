@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — WebSocket relay, memory bounds
 
 - HTTPS filtering relays WebSockets. An HTTP/1.1 `Upgrade: websocket` handshake goes to the
   origin over its own HTTP/1.1 connection and both upgraded streams are copied after the `101`;
