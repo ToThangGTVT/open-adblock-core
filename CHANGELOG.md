@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2 — system resolver
+
+- Policy option `systemResolver` (default `false`): for hosts whose apps all resolve through one
+  system resolver (macOS mDNSResponder), IP→domain attribution uses one table for every owner, so
+  connections still find their domain once `connectionOwner` reports real apps. Hosts that leave
+  it off (Android) are unchanged. `API_VERSION` is unchanged.
+
 ## 0.8.1 — request paths in events
 
 - `https` events from the browser proxy carry an optional `path` (no query, at most 2048 bytes)

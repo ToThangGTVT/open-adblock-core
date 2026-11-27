@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "io.github.tothanggtvt.openadblock"
-version = "0.8.1"
+version = "0.8.2"
 
 java {
     withSourcesJar()
