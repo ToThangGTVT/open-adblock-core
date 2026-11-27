@@ -30,6 +30,10 @@ pub struct StackBuilder {
     // high-BDP hosts can raise it without recompiling.
     tcp_recv_buffer_size: u32,
     tcp_send_buffer_size: u32,
+    // Ring buffers between each smoltcp socket and its `TcpStream`; `None` sizes them like the
+    // window above.
+    tcp_control_buffer_size: Option<u32>,
+    tcp_max_sockets: usize,
     mtu: usize,
     ip_filters: IpFilters<'static>,
 }
@@ -51,6 +55,8 @@ impl Default for StackBuilder {
             // `tcp_{recv,send}_buffer_size` for a high-BDP path.
             tcp_recv_buffer_size: 0x3FFF * 20,
             tcp_send_buffer_size: 0x3FFF * 20,
+            tcp_control_buffer_size: None,
+            tcp_max_sockets: crate::tcp::DEFAULT_MAX_SOCKETS,
             mtu: 1504, // 1500 for Ethernet + 4 for VLAN
             ip_filters: IpFilters::with_non_broadcast(),
         }
@@ -103,6 +109,22 @@ impl StackBuilder {
     /// `SocketBuffer` capacity). See [`Self::tcp_recv_buffer_size`].
     pub fn tcp_send_buffer_size(mut self, size: u32) -> Self {
         self.tcp_send_buffer_size = size;
+        self
+    }
+
+    /// Size of the two ring buffers that stage bytes between each smoltcp socket and its
+    /// [`crate::TcpStream`] (default: the window sizes above). They only batch copies, they do
+    /// not limit the TCP window, so they can be much smaller than it.
+    pub fn tcp_control_buffer_size(mut self, size: u32) -> Self {
+        self.tcp_control_buffer_size = Some(size);
+        self
+    }
+
+    /// Cap on TCP sockets alive at once (any state, TIME-WAIT included). Each one holds four
+    /// buffers of the recv/send sizes above; a SYN beyond the cap is answered with an RST
+    /// instead of allocating another socket.
+    pub fn tcp_max_sockets(mut self, max: usize) -> Self {
+        self.tcp_max_sockets = max;
         self
     }
 
@@ -175,6 +197,8 @@ impl StackBuilder {
                 self.mtu,
                 self.tcp_recv_buffer_size,
                 self.tcp_send_buffer_size,
+                self.tcp_control_buffer_size,
+                self.tcp_max_sockets,
             )?;
             (Some(tcp_runner), Some(tcp_listener))
         } else {

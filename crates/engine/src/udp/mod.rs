@@ -115,7 +115,6 @@ pub async fn serve(
                 let replies = reply_tx.clone();
                 flows.spawn(async move {
                     if let Ok(socket) = sockets::connect_udp(destination, protector.as_ref(), &stats).await {
-                        let mut buffer = vec![0u8; 65535];
                         loop {
                             let activity = async {
                                 tokio::select! {
@@ -123,9 +122,8 @@ pub async fn serve(
                                         Some(data) => socket.send(&data).await.map(|_| ()),
                                         None => Err(std::io::ErrorKind::BrokenPipe.into()),
                                     },
-                                    received = socket.recv(&mut buffer) => {
-                                        let len = received?;
-                                        replies.send((buffer[..len].to_vec(), original, client)).await
+                                    received = receive(&socket) => {
+                                        replies.send((received?, original, client)).await
                                             .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
                                     }
                                 }
@@ -142,6 +140,27 @@ pub async fn serve(
     while dns_jobs.join_next().await.is_some() {}
     flows.abort_all();
     while flows.join_next().await.is_some() {}
+}
+
+/// Receives one datagram in full (up to 64 KiB, so nothing is truncated) without a per-flow
+/// buffer: each of up to 1024 flows used to own a 64 KiB `vec!`, 64 MB in all. The datagram is
+/// read synchronously into one buffer per thread and copied out at its real size.
+async fn receive(socket: &tokio::net::UdpSocket) -> std::io::Result<Vec<u8>> {
+    thread_local! {
+        static BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; 65535]);
+    }
+    loop {
+        socket.readable().await?;
+        let received = BUFFER.with_borrow_mut(|buffer| {
+            socket
+                .try_recv(buffer)
+                .map(|length| buffer[..length].to_vec())
+        });
+        match received {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            result => return result,
+        }
+    }
 }
 
 /// UDP/443 is dropped only for apps whose HTTPS is filtered, so they fall back to TCP where the

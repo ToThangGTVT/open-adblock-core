@@ -440,10 +440,13 @@ pub unsafe extern "C" fn oab_generate_root_ca(
     certificate: *mut *mut u8,
     certificate_length: *mut usize,
 ) -> bool {
+    // Take the signer (and so its context) first: `release` must run on every failure too, and
+    // returning before this point leaked the host's context (a retained Swift box).
+    let signer = signer(signer_, public_point, public_length);
     if certificate.is_null() || certificate_length.is_null() {
         return false;
     }
-    let Some(der) = signer(signer_, public_point, public_length).and_then(api::generate_ca) else {
+    let Some(der) = signer.and_then(api::generate_ca) else {
         return false;
     };
     let der = der.into_boxed_slice();
@@ -464,12 +467,13 @@ pub unsafe extern "C" fn oab_set_root_ca(
     if signer_.is_null() {
         return api::set_ca(None);
     }
-    if certificate.is_null() {
-        return false;
-    }
+    // Take the signer (and so its context) before any early return, see `oab_generate_root_ca`.
     let Some(signer) = signer(signer_, public_point, public_length) else {
         return false;
     };
+    if certificate.is_null() {
+        return false;
+    }
     let der = std::slice::from_raw_parts(certificate, certificate_length).to_vec();
     api::set_ca(Some((signer, der)))
 }

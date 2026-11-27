@@ -7,13 +7,20 @@ use smoltcp::{
     phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     time::Instant,
 };
-use tokio::sync::mpsc::{unbounded_channel, Permit, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Permit, Receiver, Sender};
 
 use crate::packet::AnyIpPktFrame;
 
+/// Frames waiting for the interface. `receive` leaves them queued while the egress channel is
+/// full, so an unbounded queue grew without limit whenever the TUN writer fell behind. At this
+/// cap the packet handler drops further frames, as a full NIC queue would, and TCP retransmits
+/// them. Four times the stack's own egress queue, it only fills while egress is stuck; at most
+/// ~9 MB of 9000-byte frames, usually far less (most queued frames are bare ACKs).
+pub(super) const INGRESS_QUEUE: usize = 1024;
+
 pub(super) struct VirtualDevice {
     in_buf_avail: Arc<AtomicBool>,
-    in_buf: UnboundedReceiver<Vec<u8>>,
+    in_buf: Receiver<Vec<u8>>,
     out_buf: Sender<AnyIpPktFrame>,
     mtu: usize,
 }
@@ -22,9 +29,9 @@ impl VirtualDevice {
     pub(super) fn new(
         iface_egress_tx: Sender<AnyIpPktFrame>,
         mtu: usize,
-    ) -> (Self, UnboundedSender<Vec<u8>>, Arc<AtomicBool>) {
+    ) -> (Self, Sender<Vec<u8>>, Arc<AtomicBool>) {
         let iface_ingress_tx_avail = Arc::new(AtomicBool::new(false));
-        let (iface_ingress_tx, iface_ingress_rx) = unbounded_channel();
+        let (iface_ingress_tx, iface_ingress_rx) = channel(INGRESS_QUEUE);
         (
             Self {
                 in_buf_avail: iface_ingress_tx_avail.clone(),
@@ -120,7 +127,7 @@ mod tests {
         out_tx.try_send(vec![0u8; 4]).unwrap();
 
         // Queue an in_buf packet and mark it available, as handle_packet would.
-        ingress_tx.send(b"payload".to_vec()).unwrap();
+        ingress_tx.try_send(b"payload".to_vec()).unwrap();
         in_buf_avail.store(true, Ordering::Release);
 
         // out_buf is full: receive() must yield nothing this poll...
@@ -140,5 +147,15 @@ mod tests {
             .receive(Instant::from_millis(1))
             .expect("in_buf packet must not have been dropped while out_buf was full");
         assert_eq!(rx_token.consume(|buf| buf.to_vec()), b"payload");
+    }
+
+    #[test]
+    fn ingress_queue_is_bounded() {
+        let (out_tx, _out_rx) = channel::<AnyIpPktFrame>(1);
+        let (_device, ingress_tx, _) = VirtualDevice::new(out_tx, 1500);
+        for _ in 0..INGRESS_QUEUE {
+            ingress_tx.try_send(vec![0u8; 4]).unwrap();
+        }
+        assert!(ingress_tx.try_send(vec![0u8; 4]).is_err());
     }
 }

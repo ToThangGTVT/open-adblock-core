@@ -7,6 +7,18 @@
   network rules (`$websocket`) apply to the handshake URL. Before, the first socket to each host
   got `501` and the host was bypassed, which broke chat sites such as Zalo Web on first load.
 - `proxy::Connector` takes `http1_only` (the ALPN offer for that connection).
+- Memory bounds in the tunnel (the macOS extension peaked at ~340 MB):
+  - A retransmitted SYN no longer creates a second smoltcp socket that stayed in LISTEN forever;
+    handshakes not done within 30 s are dropped; at most 1024 TCP sockets exist (a SYN beyond
+    that gets an RST). New `StackBuilder::tcp_max_sockets` / `tcp_control_buffer_size`.
+  - The socket↔stream staging rings are 16 KiB instead of the 64 KiB window (the window and
+    so throughput are unchanged).
+  - The TCP ingress queue is bounded (1024 frames; overflow is dropped, TCP retransmits).
+  - WebSocket relays run inside their flow: idle timer, relay slot and network-change abort
+    now cover them.
+  - UDP flows share one receive buffer per thread instead of 64 KiB each.
+  - Decrypted HTTP/2 upstreams use 2 MB / 1 MB flow-control windows instead of 5 MB / 2 MB.
+- `oab_set_root_ca` / `oab_generate_root_ca` release the signer context on every early return.
 
 ## 0.7.0 — app proxy
 

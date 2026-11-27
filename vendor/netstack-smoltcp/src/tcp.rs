@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -22,7 +22,10 @@ use spin::Mutex as SpinMutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{
-        mpsc::{unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        mpsc::{
+            error::TrySendError, unbounded_channel, Receiver, Sender, UnboundedReceiver,
+            UnboundedSender,
+        },
         Notify,
     },
 };
@@ -54,10 +57,57 @@ struct TcpSocketControl {
 struct TcpSocketCreation {
     control: SharedControl,
     socket: TcpSocket<'static>,
+    key: FlowKey,
 }
 
 type SharedNotify = Arc<Notify>;
 type SharedControl = Arc<SpinMutex<TcpSocketControl>>;
+/// (client, destination) of one TCP connection.
+type FlowKey = (SocketAddr, SocketAddr);
+
+/// A handshake that has not reached ESTABLISHED within this time is abandoned (the client gave
+/// up, or its SYN was lost before reaching the socket). Without it a socket that never sees its
+/// SYN would sit in LISTEN, holding its buffers, forever; Linux gives up on a SYN-ACK after ~63 s.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default for [`crate::StackBuilder::tcp_max_sockets`].
+pub(crate) const DEFAULT_MAX_SOCKETS: usize = 1024;
+
+/// Bookkeeping shared by the packet handler (which creates sockets) and the socket poller
+/// (which retires them). Both run inside the same runner future, never concurrently.
+#[derive(Default)]
+struct SocketRegistry {
+    /// Flows whose socket still waits for its handshake to complete. A retransmitted SYN for one
+    /// of these is passed to the existing socket instead of creating a duplicate, which would
+    /// stay in LISTEN forever (nothing else ever matches it) and leak its buffers.
+    handshaking: HashSet<FlowKey>,
+    /// Sockets created and not yet removed, in any state (TIME-WAIT included).
+    live: usize,
+}
+impl SocketRegistry {
+    /// Whether a SYN for `key` gets a new socket; if so it is counted from now on.
+    fn admit(&mut self, key: FlowKey, max_sockets: usize) -> bool {
+        if self.handshaking.contains(&key) {
+            return false;
+        }
+        if self.live >= max_sockets {
+            trace!("TCP socket cap ({max_sockets}) reached, resetting {key:?}");
+            return false;
+        }
+        self.handshaking.insert(key);
+        self.live += 1;
+        true
+    }
+}
+type SharedRegistry = Arc<SpinMutex<SocketRegistry>>;
+
+struct TrackedSocket {
+    control: SharedControl,
+    key: FlowKey,
+    created: Instant,
+    /// Still listed in `SocketRegistry::handshaking`.
+    handshaking: bool,
+}
 
 struct TcpListenerRunner;
 
@@ -66,20 +116,22 @@ impl TcpListenerRunner {
     fn create(
         device: VirtualDevice,
         iface: Interface,
-        iface_ingress_tx: UnboundedSender<Vec<u8>>,
+        iface_ingress_tx: Sender<Vec<u8>>,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
-        sockets: HashMap<SocketHandle, SharedControl>,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        control_buffer_size: Option<u32>,
+        max_sockets: usize,
     ) -> Runner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
+            let registry = SharedRegistry::default();
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, tcp_recv_buffer_size, tcp_send_buffer_size) => v,
-                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, registry.clone(), tcp_recv_buffer_size, tcp_send_buffer_size, control_buffer_size, max_sockets) => v,
+                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, registry, socket_rx) => v,
             };
             res?;
             trace!("VirtDevice::poll thread exited");
@@ -90,14 +142,31 @@ impl TcpListenerRunner {
     #[allow(clippy::too_many_arguments)]
     async fn handle_packet(
         notify: SharedNotify,
-        iface_ingress_tx: UnboundedSender<Vec<u8>>,
+        iface_ingress_tx: Sender<Vec<u8>>,
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
+        registry: SharedRegistry,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        control_buffer_size: Option<u32>,
+        max_sockets: usize,
     ) -> std::io::Result<()> {
+        // The ingress queue is bounded (see `VirtualDevice`). When the interface cannot keep up
+        // the frame is dropped, as a full NIC queue would: TCP retransmits it.
+        let ingress = |frame: Vec<u8>| -> std::io::Result<()> {
+            match iface_ingress_tx.try_send(frame) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => trace!("TCP ingress queue full, dropping frame"),
+                Err(TrySendError::Closed(_)) => {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+            }
+            iface_ingress_tx_avail.store(true, Ordering::Release);
+            notify.notify_one();
+            Ok(())
+        };
         while let Some(frame) = tcp_rx.recv().await {
             let packet = match IpPacket::new_checked(frame.as_slice()) {
                 Ok(p) => p,
@@ -109,11 +178,7 @@ impl TcpListenerRunner {
 
             // Specially handle icmp packet by TCP interface.
             if matches!(packet.protocol(), IpProtocol::Icmp | IpProtocol::Icmpv6) {
-                iface_ingress_tx
-                    .send(frame)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-                iface_ingress_tx_avail.store(true, Ordering::Release);
-                notify.notify_one();
+                ingress(frame)?;
                 continue;
             }
 
@@ -134,8 +199,14 @@ impl TcpListenerRunner {
             let src_addr = SocketAddr::new(src_ip, src_port);
             let dst_addr = SocketAddr::new(dst_ip, dst_port);
 
-            // TCP first handshake packet, create a new Connection
-            if packet.syn() && !packet.ack() {
+            // TCP first handshake packet, create a new Connection, unless this is a retransmitted
+            // SYN for a socket that already exists, or the socket cap is reached. In both cases
+            // the frame still goes to the interface: the existing socket answers the retransmit,
+            // and with no socket listening smoltcp answers the SYN with an RST.
+            if packet.syn()
+                && !packet.ack()
+                && registry.lock().admit((src_addr, dst_addr), max_sockets)
+            {
                 let mut socket = TcpSocket::new(
                     TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
                     TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
@@ -148,15 +219,26 @@ impl TcpListenerRunner {
 
                 if let Err(err) = socket.listen(dst_addr) {
                     error!("listen error: {:?}", err);
+                    let mut registry = registry.lock();
+                    registry.handshaking.remove(&(src_addr, dst_addr));
+                    registry.live -= 1;
                     continue;
                 }
 
                 trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; tcp_send_buffer_size as usize]),
+                    send_buffer: RingBuffer::new(vec![
+                        0u8;
+                        control_buffer_size.unwrap_or(tcp_send_buffer_size)
+                            as usize
+                    ]),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; tcp_recv_buffer_size as usize]),
+                    recv_buffer: RingBuffer::new(vec![
+                        0u8;
+                        control_buffer_size.unwrap_or(tcp_recv_buffer_size)
+                            as usize
+                    ]),
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
@@ -171,16 +253,16 @@ impl TcpListenerRunner {
                     })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 socket_tx
-                    .send(TcpSocketCreation { control, socket })
+                    .send(TcpSocketCreation {
+                        control,
+                        socket,
+                        key: (src_addr, dst_addr),
+                    })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
             }
 
             // Pipeline tcp stream packet
-            iface_ingress_tx
-                .send(frame)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-            iface_ingress_tx_avail.store(true, Ordering::Release);
-            notify.notify_one();
+            ingress(frame)?;
         }
         Ok(())
     }
@@ -190,14 +272,28 @@ impl TcpListenerRunner {
         mut device: VirtualDevice,
         mut iface: Interface,
         iface_ingress_tx_avail: Arc<AtomicBool>,
-        mut sockets: HashMap<SocketHandle, SharedControl>,
+        registry: SharedRegistry,
         mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
+        let mut sockets = HashMap::<SocketHandle, TrackedSocket>::new();
         loop {
-            while let Ok(TcpSocketCreation { control, socket }) = socket_rx.try_recv() {
+            while let Ok(TcpSocketCreation {
+                control,
+                socket,
+                key,
+            }) = socket_rx.try_recv()
+            {
                 let handle = socket_set.add(socket);
-                sockets.insert(handle, control);
+                sockets.insert(
+                    handle,
+                    TrackedSocket {
+                        control,
+                        key,
+                        created: Instant::now(),
+                        handshaking: true,
+                    },
+                );
             }
 
             let before_poll = Instant::now();
@@ -212,10 +308,21 @@ impl TcpListenerRunner {
             // Check all the sockets' status
             let mut sockets_to_remove = Vec::new();
 
-            for (socket_handle, control) in sockets.iter() {
+            for (socket_handle, tracked) in sockets.iter_mut() {
                 let socket_handle = *socket_handle;
                 let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
-                let mut control = control.lock();
+                let mut control = tracked.control.lock();
+
+                if tracked.handshaking {
+                    if !matches!(socket.state(), TcpState::Listen | TcpState::SynReceived) {
+                        // Handshake over: a later SYN with this 4-tuple is a new connection.
+                        tracked.handshaking = false;
+                        registry.lock().handshaking.remove(&tracked.key);
+                    } else if Instant::now() - tracked.created > HANDSHAKE_TIMEOUT {
+                        trace!("TCP handshake timed out, {:?}", socket.state());
+                        socket.abort();
+                    }
+                }
 
                 // Remove the socket only when it is in the closed state.
                 if socket.state() == TcpState::Closed {
@@ -336,7 +443,13 @@ impl TcpListenerRunner {
             }
 
             for socket_handle in sockets_to_remove {
-                sockets.remove(&socket_handle);
+                if let Some(tracked) = sockets.remove(&socket_handle) {
+                    let mut registry = registry.lock();
+                    if tracked.handshaking {
+                        registry.handshaking.remove(&tracked.key);
+                    }
+                    registry.live -= 1;
+                }
                 socket_set.remove(socket_handle);
             }
 
@@ -375,6 +488,8 @@ impl TcpListener {
         mtu: usize,
         tcp_recv_buffer_size: u32,
         tcp_send_buffer_size: u32,
+        control_buffer_size: Option<u32>,
+        max_sockets: usize,
     ) -> std::io::Result<(Runner, Self)> {
         let (mut device, iface_ingress_tx, iface_ingress_tx_avail) =
             VirtualDevice::new(stack_tx, mtu);
@@ -389,9 +504,10 @@ impl TcpListener {
             iface_ingress_tx_avail,
             tcp_rx,
             stream_tx,
-            HashMap::new(),
             tcp_recv_buffer_size,
             tcp_send_buffer_size,
+            control_buffer_size,
+            max_sockets,
         );
 
         Ok((runner, Self { stream_rx }))
@@ -634,5 +750,50 @@ mod idle_tests {
         notify.notify_one();
         assert!(futures::poll!(waiting.as_mut()).is_ready());
         wait_for_work(&notify, Some(Duration::ZERO)).await;
+    }
+}
+
+#[cfg(test)]
+mod socket_cap_tests {
+    use futures::{SinkExt, StreamExt};
+
+    fn syn(src_port: u16) -> Vec<u8> {
+        let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .tcp(src_port, 443, 1000, 65535)
+            .syn();
+        let mut packet = Vec::with_capacity(builder.size(0));
+        builder.write(&mut packet, &[]).unwrap();
+        packet
+    }
+
+    #[tokio::test]
+    async fn retransmitted_syn_reuses_its_socket_and_the_cap_resets() {
+        let (mut stack, runner, _udp, listener) = crate::StackBuilder::default()
+            .enable_tcp(true)
+            .tcp_max_sockets(2)
+            .build()
+            .unwrap();
+        tokio::spawn(runner.unwrap());
+        let mut listener = listener.unwrap();
+        for port in [40000, 40000, 40001, 40002] {
+            stack.send(syn(port)).await.unwrap();
+        }
+        let wait = std::time::Duration::from_millis(300);
+        let mut streams = Vec::new();
+        while let Ok(Some((_, source, _))) = tokio::time::timeout(wait, listener.next()).await {
+            streams.push(source.port());
+        }
+        // One socket for 40000 despite the retransmit, one for 40001; 40002 is over the cap.
+        assert_eq!(streams, [40000, 40001]);
+        let mut reset = Vec::new();
+        while let Ok(Some(Ok(packet))) = tokio::time::timeout(wait, stack.next()).await {
+            let packet = etherparse::SlicedPacket::from_ip(&packet).unwrap();
+            if let Some(etherparse::TransportSlice::Tcp(tcp)) = packet.transport {
+                if tcp.rst() {
+                    reset.push(tcp.destination_port());
+                }
+            }
+        }
+        assert_eq!(reset, [40002]);
     }
 }

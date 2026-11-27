@@ -221,8 +221,20 @@ impl Engine {
                             .stack_buffer_size(512)
                             .tcp_buffer_size(256)
                             .udp_buffer_size(512)
+                            // The TCP window toward apps. Kept at 64 KiB: with the 9000-byte MTU
+                            // that is only ~7 segments, and less would stall on apps' delayed
+                            // ACKs (Android's kernel waits up to 40 ms for a second segment).
                             .tcp_recv_buffer_size(65536)
                             .tcp_send_buffer_size(65536)
+                            // The staging rings between socket and stream only batch copies
+                            // (the relay reads and writes 8 KiB at a time), so they need not
+                            // match the window: 2×64 + 2×16 KiB per socket instead of 4×64.
+                            .tcp_control_buffer_size(16 * 1024)
+                            // Sockets are not covered by the 256-relay cap in `tcp::serve`:
+                            // refused flows and TIME-WAIT (10 s after every close we start)
+                            // hold one too. 1024 leaves room for ~75 closes/s at the relay cap
+                            // while bounding sockets to ~160 MB; past it a SYN gets an RST.
+                            .tcp_max_sockets(1024)
                             .build()?;
                         let (mut sink, mut stream) = stack.split();
                         let dns = crate::dns::Session::new(protector.clone(), thread_stats.clone());

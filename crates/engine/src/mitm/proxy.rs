@@ -68,6 +68,9 @@ struct UpstreamState {
 struct Upstream {
     state: Mutex<UpstreamState>,
     reconnect: Connector,
+    /// Tasks that outlive the request that started them (WebSocket relays). `serve` runs them
+    /// in its own `JoinSet`, see there.
+    tasks: tokio::sync::mpsc::UnboundedSender<BoxFuture<'static, ()>>,
 }
 struct Driver(JoinHandle<()>);
 impl Drop for Driver {
@@ -175,6 +178,13 @@ async fn connection(
     if upstream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice()) {
         let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
+            // Flow-control windows bound what the origin may push before the app reads it
+            // (a paused video keeps its stream full). hyper's 5 MB connection / 2 MB stream
+            // defaults let every decrypted connection hold that much. The windows also cap
+            // throughput at window ÷ RTT: 2 MB / 1 MB still allow ~160 / 80 Mbit/s per
+            // connection / stream at a 100 ms mobile RTT.
+            .initial_connection_window_size(2 * 1024 * 1024)
+            .initial_stream_window_size(1024 * 1024)
             .handshake(TokioIo::new(upstream))
             .await
             .map_err(io::Error::other)?;
@@ -416,12 +426,14 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
     let client_h2 = client.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
     let (sender, driver) = connection(upstream.tls, domain.clone(), owner.uid).await?;
+    let (tasks, mut queued) = tokio::sync::mpsc::unbounded_channel();
     let upstream = Arc::new(Upstream {
         state: Mutex::new(UpstreamState {
             sender,
             drivers: vec![driver],
         }),
         reconnect: upstream.reconnect,
+        tasks,
     });
     let service = hyper::service::service_fn(move |request: Request<Incoming>| {
         let upstream = upstream.clone();
@@ -431,20 +443,47 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Ok::<_, Infallible>(forward(request, upstream, &domain, destination, &owner).await)
         }
     });
-    if client_h2 {
+    let mut connection: BoxFuture<'static, Result<(), hyper::Error>> = if client_h2 {
         let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
         builder
             .max_concurrent_streams(32)
             .max_header_list_size(MAX_HEADER_LIST_SIZE)
             .max_send_buf_size(65536);
-        tokio::select! {result=builder.serve_connection(TokioIo::new(client),service)=>finish(result)?,_=revision.changed()=>{}}
+        Box::pin(builder.serve_connection(TokioIo::new(client), service))
     } else {
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder
             .max_buf_size(MAX_HEADER_LIST_SIZE as usize)
             .max_headers(100);
         // Upgrades: a WebSocket hands the browser's TLS stream to its own task (`websocket`).
-        tokio::select! {result=builder.serve_connection(TokioIo::new(client),service).with_upgrades()=>finish(result)?,_=revision.changed()=>{}}
+        Box::pin(
+            builder
+                .serve_connection(TokioIo::new(client), service)
+                .with_upgrades(),
+        )
+    };
+    // A WebSocket outlives the HTTP connection that upgraded it. Its relay runs here rather than
+    // detached so that it stays inside this flow: under the caller's idle timer and relay slot
+    // (`tcp::relay`), and aborted with it on a network or filter change.
+    let mut running = tokio::task::JoinSet::new();
+    let mut serving = true;
+    while serving || !running.is_empty() {
+        tokio::select! {
+            result = &mut connection, if serving => {
+                serving = false;
+                // The relay is queued before the 101 is returned, so it is here by now.
+                while let Ok(task) = queued.try_recv() {
+                    running.spawn(task);
+                }
+                queued.close();
+                finish(result)?;
+            }
+            Some(task) = queued.recv(), if serving => {
+                running.spawn(task);
+            }
+            Some(_) = running.join_next(), if !running.is_empty() => {}
+            _ = revision.changed() => break,
+        }
     }
     Ok(())
 }
@@ -658,11 +697,11 @@ async fn websocket_upgrade(
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(tls)).await?;
         let report = domain.to_owned();
-        tokio::spawn(async move {
+        let _ = upstream.tasks.send(Box::pin(async move {
             if let Err(error) = connection.with_upgrades().await {
                 report_error(&report, uid, "upstream WebSocket", &error);
             }
-        });
+        }));
         Ok::<_, BoxError>(sender.send_request(outgoing).await?)
     };
     let mut response = match tokio::time::timeout(Duration::from_secs(30), handshake).await {
@@ -676,7 +715,7 @@ async fn websocket_upgrade(
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         let server_upgrade = hyper::upgrade::on(&mut response);
         let report = domain.to_owned();
-        tokio::spawn(async move {
+        let _ = upstream.tasks.send(Box::pin(async move {
             match tokio::join!(client_upgrade, server_upgrade) {
                 (Ok(client), Ok(server)) => {
                     let (mut client, mut server) = (TokioIo::new(client), TokioIo::new(server));
@@ -686,7 +725,7 @@ async fn websocket_upgrade(
                     report_error(&report, uid, "WebSocket upgrade", &error)
                 }
             }
-        });
+        }));
         // Keep Connection/Upgrade (hop-by-hop, but they are the 101's meaning) and the
         // Sec-WebSocket-* answers the browser verifies.
         let (parts, _) = response.into_parts();
