@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.1 — request paths in events
+
+- `https` events from the browser proxy carry an optional `path` (no query, at most 2048 bytes)
+  so hosts can show the full URL of each inspected request. `API_VERSION` is unchanged.
+
 ## 0.8.0 — WebSocket relay, memory bounds
 
 - HTTPS filtering relays WebSockets. An HTTP/1.1 `Upgrade: websocket` handshake goes to the
